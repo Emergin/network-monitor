@@ -1,0 +1,71 @@
+{
+  "monitoring": {
+    "interval": 30,
+    "timeout": 5,
+    "max_retries": 3
+  },
+  "targets": {
+    "hosts": [
+      {
+        "name": "localhost",
+        "ip": "127.0.0.1",
+        "enabled": true
+      },
+      {
+        "name": "local-gateway",
+        "ip": "192.168.1.1",
+        "enabled": true
+      }
+    ],
+    "services": [
+      {
+        "name": "HTTP Server",
+        "host": "127.0.0.1",
+        "port": 80,
+        "enabled": true
+      },
+      {
+        "name": "SSH Service",
+        "host": "127.0.0.1",
+        "port": 22,
+        "enabled": true
+      },
+      {
+        "name": "Development Server",
+        "host": "127.0.0.1",
+        "port": 3000,
+        "enabled": true
+      },
+      {
+        "name": "PostgreSQL",
+        "host": "127.0.0.1",
+        "port": 5432,
+        "enabled": false
+      },
+      {
+        "name": "MySQL",
+        "host": "127.0.0.1",
+        "port": 3306,
+        "enabled": false
+      }
+    ]
+  },
+  "alerts": {
+    "enabled": true,
+    "console": true,
+    "email": false,
+    "email_settings": {
+      "smtp_server": "smtp.gmail.com",
+      "smtp_port": 587,
+      "username": "",
+      "password": "",
+      "to_email": ""
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/network_monitor.log",
+    "max_size_mb": 10,
+    "backup_count": 5
+  }
+}
