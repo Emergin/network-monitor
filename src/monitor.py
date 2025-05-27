@@ -1,345 +1,427 @@
-"""
-Main Monitor Module
-Orchestrates all monitoring activities and coordinates components
-"""
-import time
+import socket
+import subprocess
 import threading
+import time
 import json
-import os
-from datetime import datetime
-from typing import Dict, Any, List
-from .config_manager import ConfigManager
-from .logger import NetworkLogger
-from .ping_checker import PingChecker
-from .port_checker import PortChecker
-from .alert_system import AlertSystem
-from .dashboard import Dashboard
-
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import concurrent.futures
+import platform
 
 class NetworkMonitor:
-    def __init__(self, config_path: str = "config.json"):
-        # Initialize components
-        self.config_manager = ConfigManager(config_path)
-        self.logger = NetworkLogger(self.config_manager.get_log_config())
-        self.ping_checker = PingChecker(timeout=self.config_manager.get_timeout())
-        self.port_checker = PortChecker(timeout=self.config_manager.get_timeout())
-        self.alert_system = AlertSystem(
-            self.config_manager.config.get('alerts', {}), 
-            self.logger
-        )
-        self.dashboard = Dashboard(self.config_manager)
-        
-        # Monitoring state
-        self.is_running = False
-        self.monitor_thread = None
-        self.last_results = {
-            'hosts': {},
-            'services': {}
-        }
-        self.previous_status = {
-            'hosts': {},
-            'services': {}
-        }
+    def __init__(self, config_file: str = "config.json"):
+        self.config = self.load_config(config_file)
+        self.monitoring_active = False
+        self.results = {}
         self.alert_history = []
-        self.status_history_file = "data/status_history.json"
+        self.setup_logging()
         
-        # Create data directory if it doesn't exist
-        os.makedirs("data", exist_ok=True)
-        os.makedirs("logs", exist_ok=True)
-        
-        self.logger.log_monitor_start()
-    
-    def start_monitoring(self) -> None:
-        """Start the monitoring process"""
-        if self.is_running:
-            self.logger.warning("Monitoring is already running")
-            return
-        
-        self.is_running = True
-        self.dashboard.display_startup_message()
-        time.sleep(3)  # Give user time to read startup message
-        
-        # Start monitoring in separate thread
-        self.monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
-        self.monitor_thread.start()
-        
-        # Start dashboard updates
-        self._dashboard_loop()
-    
-    def stop_monitoring(self) -> None:
-        """Stop the monitoring process"""
-        if not self.is_running:
-            return
-        
-        self.is_running = False
-        self.logger.log_monitor_stop()
-        
-        if self.monitor_thread:
-            self.monitor_thread.join(timeout=5)
-        
-        # Save final status
-        self._save_status_history()
-        
-        print("\n" + "="*50)
-        print("Network Monitor stopped gracefully")
-        print("="*50)
-    
-    def _monitoring_loop(self) -> None:
-        """Main monitoring loop"""
-        interval = self.config_manager.get_monitoring_interval()
-        
-        while self.is_running:
-            try:
-                # Perform checks
-                self._perform_checks()
-                
-                # Wait for next interval
-                time.sleep(interval)
-                
-            except Exception as e:
-                self.logger.error(f"Error in monitoring loop: {e}")
-                time.sleep(5)  # Wait before retrying
-    
-    def _perform_checks(self) -> None:
-        """Perform all monitoring checks"""
-        # Get targets from configuration
-        hosts = self.config_manager.get_hosts()
-        services = self.config_manager.get_services()
-        
-        # Perform ping checks
-        if hosts:
-            host_results = self.ping_checker.ping_multiple_hosts(hosts)
-            self._process_host_results(host_results)
-            self.last_results['hosts'] = host_results
-        
-        # Perform port checks
-        if services:
-            service_results = self.port_checker.check_multiple_ports(services)
-            self._process_service_results(service_results)
-            self.last_results['services'] = service_results
-        
-        # Update dashboard stats
-        self.dashboard.update_stats(
-            self.last_results.get('hosts', {}),
-            self.last_results.get('services', {})
-        )
-        
-        # Save status history
-        self._save_status_history()
-    
-    def _process_host_results(self, host_results: Dict[str, Any]) -> None:
-        """Process host ping results and generate alerts"""
-        for host_name, result in host_results.items():
-            current_status = result.get('success', False)
-            previous_status = self.previous_status.get('hosts', {}).get(host_name, {}).get('success')
+        # Common ports to monitor on laptops
+        self.default_ports = {
+            # Web services
+            80: "HTTP",
+            443: "HTTPS",
+            8080: "HTTP Alt",
+            8443: "HTTPS Alt",
+            3000: "Development Server",
+            3001: "React Dev",
+            4200: "Angular Dev",
+            5173: "Vite Dev",
             
-            # Log result
-            if current_status:
-                self.logger.log_ping_result(
-                    result.get('ip', host_name), 
-                    True, 
-                    result.get('response_time')
-                )
-            else:
-                self.logger.log_ping_result(result.get('ip', host_name), False)
+            # Database services
+            3306: "MySQL",
+            5432: "PostgreSQL",
+            27017: "MongoDB",
+            6379: "Redis",
+            1433: "SQL Server",
+            1521: "Oracle",
             
-            # Check for status changes
-            if previous_status is not None and current_status != previous_status:
-                if current_status:
-                    # Host came back up
-                    self.alert_system.send_alert(
-                        'host_up', host_name, result.get('ip', host_name)
-                    )
-                    self.logger.log_service_up(host_name, result.get('ip', host_name))
-                    self._add_alert_to_history('host_up', host_name, f"Host {host_name} recovered")
-                else:
-                    # Host went down
-                    self.alert_system.send_alert(
-                        'host_down', host_name, result.get('ip', host_name)
-                    )
-                    self.logger.log_service_down(host_name, result.get('ip', host_name))
-                    self._add_alert_to_history('host_down', host_name, f"Host {host_name} is unreachable")
-        
-        # Update previous status
-        if 'hosts' not in self.previous_status:
-            self.previous_status['hosts'] = {}
-        self.previous_status['hosts'].update(host_results)
+            # Email services
+            25: "SMTP",
+            110: "POP3",
+            143: "IMAP",
+            465: "SMTP SSL",
+            587: "SMTP TLS",
+            993: "IMAP SSL",
+            995: "POP3 SSL",
+            
+            # File sharing
+            21: "FTP",
+            22: "SSH/SFTP",
+            23: "Telnet",
+            69: "TFTP",
+            135: "RPC",
+            139: "NetBIOS",
+            445: "SMB",
+            548: "AFP",
+            2049: "NFS",
+            
+            # Remote access
+            3389: "RDP",
+            5900: "VNC",
+            5901: "VNC Alt",
+            5902: "VNC Alt2",
+            4899: "Radmin",
+            
+            # Development & APIs
+            8000: "Python Dev",
+            8001: "Python Alt",
+            5000: "Flask Default",
+            5001: "Flask Alt",
+            9000: "Development",
+            9001: "Development Alt",
+            7000: "Development",
+            6000: "Development",
+            4000: "Development",
+            
+            # Gaming & Streaming
+            25565: "Minecraft",
+            7777: "Gaming",
+            27015: "Steam",
+            1935: "RTMP",
+            
+            # System services
+            53: "DNS",
+            67: "DHCP Server",
+            68: "DHCP Client",
+            161: "SNMP",
+            162: "SNMP Trap",
+            514: "Syslog",
+            
+            # Media & Entertainment
+            8096: "Jellyfin",
+            32400: "Plex",
+            5050: "Couchpotato",
+            8989: "Sonarr",
+            7878: "Radarr",
+            
+            # Virtualization
+            902: "VMware",
+            903: "VMware SSL",
+            8006: "Proxmox",
+            
+            # Chat & Communication
+            6667: "IRC",
+            5222: "XMPP",
+            1863: "MSN",
+            
+            # Backup & Sync
+            873: "Rsync",
+            2222: "SSH Alt",
+            
+            # Printers
+            631: "IPP",
+            515: "LPR",
+            9100: "HP JetDirect",
+            
+            # IoT & Smart Home
+            1883: "MQTT",
+            8883: "MQTT SSL",
+            8123: "Home Assistant",
+            
+            # Container services
+            2375: "Docker",
+            2376: "Docker SSL",
+            8080: "Jenkins",
+            9090: "Prometheus",
+            3000: "Grafana",
+            
+            # Security
+            1194: "OpenVPN",
+            500: "IPSec",
+            4500: "IPSec NAT"
+        }
     
-    def _process_service_results(self, service_results: Dict[str, Any]) -> None:
-        """Process service port results and generate alerts"""
-        for service_name, result in service_results.items():
-            current_status = result.get('success', False)
-            previous_status = self.previous_status.get('services', {}).get(service_name, {}).get('success')
-            
-            # Log result
-            if current_status:
-                self.logger.log_port_result(
-                    result.get('host', 'unknown'),
-                    result.get('port', 0),
-                    True,
-                    result.get('response_time')
-                )
-            else:
-                self.logger.log_port_result(
-                    result.get('host', 'unknown'),
-                    result.get('port', 0),
-                    False
-                )
-            
-            # Check for status changes
-            if previous_status is not None and current_status != previous_status:
-                if current_status:
-                    # Service came back up
-                    self.alert_system.send_alert(
-                        'service_up', service_name, 
-                        result.get('host', 'unknown'), 
-                        result.get('port')
-                    )
-                    self.logger.log_service_up(
-                        service_name, 
-                        result.get('host', 'unknown'), 
-                        result.get('port')
-                    )
-                    self._add_alert_to_history(
-                        'service_up', service_name, 
-                        f"Service {service_name} recovered"
-                    )
-                else:
-                    # Service went down
-                    self.alert_system.send_alert(
-                        'service_down', service_name,
-                        result.get('host', 'unknown'),
-                        result.get('port')
-                    )
-                    self.logger.log_service_down(
-                        service_name,
-                        result.get('host', 'unknown'),
-                        result.get('port')
-                    )
-                    self._add_alert_to_history(
-                        'service_down', service_name,
-                        f"Service {service_name} is not responding"
-                    )
-        
-        # Update previous status
-        if 'services' not in self.previous_status:
-            self.previous_status['services'] = {}
-        self.previous_status['services'].update(service_results)
-    
-    def _add_alert_to_history(self, alert_type: str, service: str, message: str) -> None:
-        """Add alert to history for dashboard display"""
-        alert = {
-            'timestamp': time.time(),
-            'type': alert_type,
-            'service': service,
-            'message': message
+    def load_config(self, config_file: str) -> Dict:
+        """Load configuration from JSON file or use defaults"""
+        default_config = {
+            "hosts": ["127.0.0.1", "8.8.8.8", "1.1.1.1"],
+            "ports": list(self.default_ports.keys()) if hasattr(self, 'default_ports') else [],
+            "ping_timeout": 3,
+            "port_timeout": 5,
+            "check_interval": 60,
+            "max_workers": 50,
+            "alerts": {
+                "enabled": True,
+                "methods": ["console"],
+                "email": {
+                    "smtp_server": "",
+                    "smtp_port": 587,
+                    "username": "",
+                    "password": "",
+                    "to_addresses": []
+                }
+            }
         }
         
-        self.alert_history.append(alert)
-        
-        # Keep only last 50 alerts
-        if len(self.alert_history) > 50:
-            self.alert_history = self.alert_history[-50:]
-    
-    def _dashboard_loop(self) -> None:
-        """Dashboard update loop"""
         try:
-            while self.is_running:
-                # Update dashboard
-                self.dashboard.display_full_dashboard(
-                    self.last_results.get('hosts', {}),
-                    self.last_results.get('services', {}),
-                    self.alert_history[-10:]  # Show last 10 alerts
-                )
-                
-                # Wait before next update
-                time.sleep(30)  # Update dashboard every 30 seconds
-                
-        except KeyboardInterrupt:
-            self.stop_monitoring()
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+            
+            # Merge with defaults
+            for key, value in default_config.items():
+                if key not in config:
+                    config[key] = value
+            
+            # Handle different host formats (string or dict)
+            if "hosts" in config:
+                normalized_hosts = []
+                for host in config["hosts"]:
+                    if isinstance(host, dict):
+                        # Extract address from dict format
+                        if "address" in host and host.get("enabled", True):
+                            normalized_hosts.append(host["address"])
+                    elif isinstance(host, str):
+                        # Use string directly
+                        normalized_hosts.append(host)
+                config["hosts"] = normalized_hosts
+            
+            return config
+        except FileNotFoundError:
+            return default_config
+    
+    def setup_logging(self):
+        """Setup logging configuration"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('logs/network_monitor.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+    
+    def ping_host(self, host: str) -> Tuple[str, bool, float]:
+        """Ping a host and return status"""
+        try:
+            # Use different ping commands based on OS
+            if platform.system().lower() == "windows":
+                cmd = ["ping", "-n", "1", "-w", str(self.config["ping_timeout"] * 1000), host]
+            else:
+                cmd = ["ping", "-c", "1", "-W", str(self.config["ping_timeout"]), host]
+            
+            start_time = time.time()
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.config["ping_timeout"] + 1)
+            response_time = (time.time() - start_time) * 1000  # Convert to ms
+            
+            success = result.returncode == 0
+            return host, success, response_time if success else 0
+            
+        except (subprocess.TimeoutExpired, Exception) as e:
+            self.logger.warning(f"Ping failed for {host}: {e}")
+            return host, False, 0
+    
+    def check_port(self, host: str, port: int) -> Tuple[str, int, bool, float]:
+        """Check if a port is open on a host"""
+        try:
+            start_time = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.config["port_timeout"])
+            
+            result = sock.connect_ex((host, port))
+            response_time = (time.time() - start_time) * 1000  # Convert to ms
+            
+            sock.close()
+            success = result == 0
+            return host, port, success, response_time if success else 0
+            
         except Exception as e:
-            self.logger.error(f"Dashboard error: {e}")
+            self.logger.warning(f"Port check failed for {host}:{port}: {e}")
+            return host, port, False, 0
     
-    def _save_status_history(self) -> None:
-        """Save current status to history file"""
-        try:
-            history_data = {
-                'timestamp': time.time(),
-                'datetime': datetime.now().isoformat(),
-                'hosts': self.last_results.get('hosts', {}),
-                'services': self.last_results.get('services', {}),
-                'summary': self.dashboard.get_status_overview(
-                    self.last_results.get('hosts', {}),
-                    self.last_results.get('services', {})
-                )
+    def scan_host_ports(self, host: str, ports: List[int] = None) -> Dict:
+        """Scan multiple ports on a single host"""
+        if ports is None:
+            ports = list(self.default_ports.keys())
+        
+        host_results = {
+            "host": host,
+            "timestamp": datetime.now().isoformat(),
+            "ping": {"status": False, "response_time": 0},
+            "ports": {}
+        }
+        
+        # First ping the host
+        _, ping_status, ping_time = self.ping_host(host)
+        host_results["ping"] = {"status": ping_status, "response_time": ping_time}
+        
+        # Only check ports if host is reachable or if it's localhost
+        if ping_status or host in ["127.0.0.1", "localhost"]:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.config["max_workers"]) as executor:
+                port_futures = {executor.submit(self.check_port, host, port): port for port in ports}
+                
+                for future in concurrent.futures.as_completed(port_futures):
+                    _, port, status, response_time = future.result()
+                    service_name = self.default_ports.get(port, f"Port {port}")
+                    host_results["ports"][port] = {
+                        "status": status,
+                        "response_time": response_time,
+                        "service": service_name
+                    }
+        
+        return host_results
+    
+    def perform_full_scan(self) -> Dict:
+        """Perform a full network scan of all configured hosts and ports"""
+        scan_results = {
+            "timestamp": datetime.now().isoformat(),
+            "hosts": {}
+        }
+        
+        self.logger.info("Starting full network scan...")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.config["hosts"])) as executor:
+            host_futures = {
+                executor.submit(self.scan_host_ports, host, self.config.get("ports", list(self.default_ports.keys()))): host 
+                for host in self.config["hosts"]
             }
             
-            # Load existing history
-            history = []
-            if os.path.exists(self.status_history_file):
+            for future in concurrent.futures.as_completed(host_futures):
+                host_result = future.result()
+                host = host_result["host"]
+                scan_results["hosts"][host] = host_result
+        
+        self.results = scan_results
+        self.check_alerts(scan_results)
+        self.logger.info("Full network scan completed")
+        
+        return scan_results
+    
+    def check_alerts(self, scan_results: Dict):
+        """Check for alert conditions and trigger notifications"""
+        if not self.config["alerts"]["enabled"]:
+            return
+        
+        current_time = datetime.now()
+        alerts = []
+        
+        for host, host_data in scan_results["hosts"].items():
+            # Check ping alerts
+            if not host_data["ping"]["status"]:
+                alerts.append({
+                    "type": "ping_down",
+                    "host": host,
+                    "message": f"Host {host} is not responding to ping",
+                    "timestamp": current_time.isoformat()
+                })
+            
+            # Check port alerts
+            for port, port_data in host_data["ports"].items():
+                if not port_data["status"]:
+                    service_name = port_data["service"]
+                    alerts.append({
+                        "type": "port_down",
+                        "host": host,
+                        "port": port,
+                        "service": service_name,
+                        "message": f"Service {service_name} on {host}:{port} is down",
+                        "timestamp": current_time.isoformat()
+                    })
+        
+        # Process alerts
+        for alert in alerts:
+            self.process_alert(alert)
+            self.alert_history.append(alert)
+        
+        # Keep only recent alerts (last 24 hours)
+        cutoff_time = current_time - timedelta(hours=24)
+        self.alert_history = [
+            alert for alert in self.alert_history 
+            if datetime.fromisoformat(alert["timestamp"]) > cutoff_time
+        ]
+    
+    def process_alert(self, alert: Dict):
+        """Process and send an alert"""
+        self.logger.warning(f"ALERT: {alert['message']}")
+        
+        # Console alert (always enabled)
+        print(f"🚨 ALERT [{alert['timestamp']}]: {alert['message']}")
+        
+        # Additional alert methods can be implemented here
+        # Email, Slack, Discord, etc.
+    
+    def start_monitoring(self):
+        """Start continuous monitoring"""
+        self.monitoring_active = True
+        self.logger.info("Network monitoring started")
+        
+        def monitor_loop():
+            while self.monitoring_active:
                 try:
-                    with open(self.status_history_file, 'r') as f:
-                        history = json.load(f)
-                except:
-                    history = []
-            
-            # Add new entry
-            history.append(history_data)
-            
-            # Keep only last 1000 entries
-            if len(history) > 1000:
-                history = history[-1000:]
-            
-            # Save back to file
-            with open(self.status_history_file, 'w') as f:
-                json.dump(history, f, indent=2)
-                
-        except Exception as e:
-            self.logger.error(f"Error saving status history: {e}")
+                    self.perform_full_scan()
+                    time.sleep(self.config["check_interval"])
+                except Exception as e:
+                    self.logger.error(f"Error in monitoring loop: {e}")
+                    time.sleep(10)  # Wait 10 seconds before retrying
+        
+        self.monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+        self.monitor_thread.start()
     
-    def get_current_status(self) -> Dict[str, Any]:
-        """Get current monitoring status"""
-        return {
-            'is_running': self.is_running,
-            'last_check': self.dashboard.last_update,
-            'hosts': self.last_results.get('hosts', {}),
-            'services': self.last_results.get('services', {}),
-            'recent_alerts': self.alert_history[-5:],
-            'stats': self.dashboard.stats
+    def stop_monitoring(self):
+        """Stop continuous monitoring"""
+        self.monitoring_active = False
+        self.logger.info("Network monitoring stopped")
+    
+    def get_status_summary(self) -> Dict:
+        """Get a summary of current network status"""
+        if not self.results:
+            return {"status": "No data available"}
+        
+        summary = {
+            "last_scan": self.results.get("timestamp"),
+            "total_hosts": len(self.results.get("hosts", {})),
+            "hosts_up": 0,
+            "hosts_down": 0,
+            "total_services": 0,
+            "services_up": 0,
+            "services_down": 0,
+            "recent_alerts": len([
+                alert for alert in self.alert_history 
+                if datetime.fromisoformat(alert["timestamp"]) > datetime.now() - timedelta(hours=1)
+            ])
         }
-    
-    def send_test_alert(self) -> None:
-        """Send test alert"""
-        self.alert_system.send_test_alert()
-    
-    def generate_summary_report(self) -> str:
-        """Generate summary report"""
-        overview = self.dashboard.get_status_overview(
-            self.last_results.get('hosts', {}),
-            self.last_results.get('services', {})
-        )
         
-        report = f"""
-Network Monitor Summary Report
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-HOST STATUS:
-- Total Hosts: {overview['total_hosts']}
-- Online: {overview['up_hosts']}
-- Offline: {overview['down_hosts']}
-
-SERVICE STATUS:
-- Total Services: {overview['total_services']}
-- Running: {overview['up_services']}
-- Stopped: {overview['down_services']}
-
-MONITORING STATS:
-- Total Checks: {self.dashboard.stats['total_checks']}
-- Successful: {self.dashboard.stats['successful_checks']}
-- Failed: {self.dashboard.stats['failed_checks']}
-- Success Rate: {(self.dashboard.stats['successful_checks'] / self.dashboard.stats['total_checks'] * 100) if self.dashboard.stats['total_checks'] > 0 else 0:.1f}%
-
-RECENT ALERTS: {len(self.alert_history)}
-        """
+        for host_data in self.results.get("hosts", {}).values():
+            if host_data["ping"]["status"]:
+                summary["hosts_up"] += 1
+            else:
+                summary["hosts_down"] += 1
+            
+            for port_data in host_data["ports"].values():
+                summary["total_services"] += 1
+                if port_data["status"]:
+                    summary["services_up"] += 1
+                else:
+                    summary["services_down"] += 1
         
-        return report
+        return summary
+    
+    def get_host_details(self, host: str) -> Optional[Dict]:
+        """Get detailed information for a specific host"""
+        if not self.results or host not in self.results.get("hosts", {}):
+            return None
+        
+        return self.results["hosts"][host]
+    
+    def get_service_status(self, service_name: str = None, port: int = None) -> List[Dict]:
+        """Get status of specific service across all hosts"""
+        if not self.results:
+            return []
+        
+        service_status = []
+        
+        for host, host_data in self.results["hosts"].items():
+            for port_num, port_data in host_data["ports"].items():
+                if (service_name and service_name.lower() in port_data["service"].lower()) or \
+                   (port and port == port_num):
+                    service_status.append({
+                        "host": host,
+                        "port": port_num,
+                        "service": port_data["service"],
+                        "status": port_data["status"],
+                        "response_time": port_data["response_time"]
+                    })
+        
+        return service_status
