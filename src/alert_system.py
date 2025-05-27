@@ -1,216 +1,294 @@
-"""
-Alert System Module
-Handles notifications and alerts for network monitoring events
-"""
 import smtplib
 import time
-from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from typing import Dict, Any, Optional
-from colorama import Fore, Style, init
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+from colorama import Fore, Back, Style, init
+from config_manager import ConfigManager
+from logger import NetworkLogger
 
 # Initialize colorama for cross-platform colored output
 init(autoreset=True)
 
-
 class AlertSystem:
-    def __init__(self, config: Dict[str, Any], logger=None):
-        self.config = config
+    def __init__(self, config_manager: ConfigManager, logger: NetworkLogger):
+        self.config = config_manager
         self.logger = logger
-        self.alert_history = {}  # Track alert history to prevent spam
-        self.cooldown_period = 300  # 5 minutes cooldown between same alerts
+        self.alert_history = {}
+        self.last_alert_time = {}
+        self.consecutive_failures = {}
         
-    def send_alert(self, alert_type: str, service_name: str, host: str, port: Optional[int] = None, 
-                   message: str = None) -> None:
+    def should_send_alert(self, identifier: str, current_status: bool) -> bool:
         """
-        Send alert notification
-        
-        Args:
-            alert_type: Type of alert ('service_down', 'service_up', 'host_down', 'host_up')
-            service_name: Name of the service or host
-            host: IP address or hostname
-            port: Port number (if applicable)
-            message: Custom alert message
+        Determine if an alert should be sent based on alert threshold and history
         """
-        # Create alert key for cooldown tracking
-        alert_key = f"{alert_type}_{service_name}_{host}_{port}"
-        current_time = time.time()
+        alert_threshold = self.config.get('monitoring.alert_threshold', 3)
         
-        # Check cooldown period
-        if self._is_in_cooldown(alert_key, current_time):
-            return
-        
-        # Update alert history
-        self.alert_history[alert_key] = current_time
-        
-        # Generate alert message
-        if not message:
-            message = self._generate_alert_message(alert_type, service_name, host, port)
-        
-        # Send console alert
-        if self.config.get('console', True):
-            self._send_console_alert(alert_type, message)
-        
-        # Send email alert
-        if self.config.get('email', False):
-            self._send_email_alert(alert_type, message, service_name)
-        
-        # Log the alert
-        if self.logger:
-            if 'down' in alert_type.lower():
-                self.logger.error(f"ALERT: {message}")
-            else:
-                self.logger.info(f"ALERT: {message}")
+        if current_status:  # Service is up
+            # Reset failure counter if service is back up
+            if identifier in self.consecutive_failures:
+                if self.consecutive_failures[identifier] > 0:
+                    # Send recovery alert
+                    self.consecutive_failures[identifier] = 0
+                    return True
+            return False
+        else:  # Service is down
+            # Increment failure counter
+            self.consecutive_failures[identifier] = self.consecutive_failures.get(identifier, 0) + 1
+            
+            # Send alert if threshold is reached
+            return self.consecutive_failures[identifier] >= alert_threshold
     
-    def _is_in_cooldown(self, alert_key: str, current_time: float) -> bool:
-        """Check if alert is in cooldown period"""
-        if alert_key in self.alert_history:
-            time_diff = current_time - self.alert_history[alert_key]
-            return time_diff < self.cooldown_period
-        return False
-    
-    def _generate_alert_message(self, alert_type: str, service_name: str, 
-                              host: str, port: Optional[int] = None) -> str:
-        """Generate formatted alert message"""
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    def send_console_alert(self, alert_type: str, message: str, severity: str = "WARNING"):
+        """
+        Send console alert with colored output
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        if alert_type == 'service_down':
-            return f"[{timestamp}] SERVICE DOWN: {service_name} on {host}:{port} is not responding"
-        elif alert_type == 'service_up':
-            return f"[{timestamp}] SERVICE RECOVERED: {service_name} on {host}:{port} is back online"
-        elif alert_type == 'host_down':
-            return f"[{timestamp}] HOST DOWN: {service_name} ({host}) is unreachable"
-        elif alert_type == 'host_up':
-            return f"[{timestamp}] HOST RECOVERED: {service_name} ({host}) is back online"
+        # Color coding based on severity
+        if severity == "CRITICAL":
+            color = Fore.RED + Back.WHITE
+        elif severity == "WARNING":
+            color = Fore.YELLOW
+        elif severity == "INFO":
+            color = Fore.GREEN
+        elif severity == "RECOVERY":
+            color = Fore.CYAN
         else:
-            return f"[{timestamp}] ALERT: {service_name} - {alert_type}"
+            color = Fore.WHITE
+        
+        console_message = f"{color}[{timestamp}] {severity} - {alert_type}: {message}{Style.RESET_ALL}"
+        print(console_message)
+        
+        self.logger.log_alert(f"{alert_type}: {message}", severity)
     
-    def _send_console_alert(self, alert_type: str, message: str) -> None:
-        """Send alert to console with colors"""
+    def send_email_alert(self, subject: str, message: str, severity: str = "WARNING") -> bool:
+        """
+        Send email alert
+        """
+        email_config = self.config.get_alert_config().get('email', {})
+        
+        if not email_config.get('enabled', False):
+            return False
+        
         try:
-            if 'down' in alert_type.lower():
-                # Red for down alerts
-                print(f"{Fore.RED}{'🔴 ' + message}{Style.RESET_ALL}")
-            elif 'up' in alert_type.lower() or 'recover' in alert_type.lower():
-                # Green for recovery alerts
-                print(f"{Fore.GREEN}{'🟢 ' + message}{Style.RESET_ALL}")
-            else:
-                # Yellow for other alerts
-                print(f"{Fore.YELLOW}{'🟡 ' + message}{Style.RESET_ALL}")
-        except Exception as e:
-            print(f"Error sending console alert: {e}")
-    
-    def _send_email_alert(self, alert_type: str, message: str, service_name: str) -> None:
-        """Send alert via email"""
-        try:
-            email_config = self.config.get('email_settings', {})
-            
-            # Check if email is properly configured
-            if not all([email_config.get('smtp_server'), 
-                       email_config.get('username'), 
-                       email_config.get('password'),
-                       email_config.get('to_email')]):
-                if self.logger:
-                    self.logger.warning("Email alerts enabled but configuration incomplete")
-                return
-            
-            # Create email message
+            # Create message
             msg = MIMEMultipart()
-            msg['From'] = email_config['username']
-            msg['To'] = email_config['to_email']
+            msg['From'] = email_config.get('from_email', '')
+            msg['Subject'] = f"[{severity}] Network Monitor Alert: {subject}"
             
-            # Set subject based on alert type
-            if 'down' in alert_type.lower():
-                msg['Subject'] = f"🔴 ALERT: {service_name} is DOWN"
-            else:
-                msg['Subject'] = f"🟢 RECOVERY: {service_name} is UP"
+            # HTML email body
+            html_body = f"""
+            <html>
+                <body>
+                    <h2 style="color: {'red' if severity == 'CRITICAL' else 'orange' if severity == 'WARNING' else 'green'};">
+                        Network Monitor Alert
+                    </h2>
+                    <p><strong>Severity:</strong> {severity}</p>
+                    <p><strong>Time:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+                    <p><strong>Subject:</strong> {subject}</p>
+                    <hr>
+                    <p>{message.replace('\n', '<br>')}</p>
+                    <hr>
+                    <p><small>This alert was generated by Network Monitor</small></p>
+                </body>
+            </html>
+            """
             
-            # Create email body
-            body = self._create_email_body(alert_type, message, service_name)
-            msg.attach(MIMEText(body, 'html'))
+            msg.attach(MIMEText(html_body, 'html'))
             
-            # Send email
-            server = smtplib.SMTP(email_config['smtp_server'], email_config.get('smtp_port', 587))
+            # Connect to SMTP server
+            server = smtplib.SMTP(email_config.get('smtp_server'), email_config.get('smtp_port', 587))
             server.starttls()
-            server.login(email_config['username'], email_config['password'])
+            server.login(email_config.get('username'), email_config.get('password'))
             
-            text = msg.as_string()
-            server.sendmail(email_config['username'], email_config['to_email'], text)
+            # Send to all recipients
+            to_emails = email_config.get('to_emails', [])
+            for email in to_emails:
+                msg['To'] = email
+                server.send_message(msg)
+                del msg['To']
+            
             server.quit()
             
-            if self.logger:
-                self.logger.info(f"Email alert sent for {service_name}")
-                
+            self.logger.log_alert(f"Email alert sent: {subject}", severity)
+            return True
+            
         except Exception as e:
-            if self.logger:
-                self.logger.error(f"Failed to send email alert: {e}")
+            self.logger.log_error('alert', e)
+            return False
     
-    def _create_email_body(self, alert_type: str, message: str, service_name: str) -> str:
-        """Create HTML email body"""
-        color = "#dc3545" if 'down' in alert_type.lower() else "#28a745"
-        icon = "🔴" if 'down' in alert_type.lower() else "🟢"
-        
-        return f"""
-        <html>
-        <body style="font-family: Arial, sans-serif; margin: 20px;">
-            <div style="border-left: 4px solid {color}; padding-left: 20px;">
-                <h2 style="color: {color}; margin-top: 0;">
-                    {icon} Network Monitor Alert
-                </h2>
-                <p style="font-size: 16px; margin: 10px 0;">
-                    <strong>Service:</strong> {service_name}
-                </p>
-                <p style="font-size: 16px; margin: 10px 0;">
-                    <strong>Status:</strong> {alert_type.replace('_', ' ').title()}
-                </p>
-                <p style="font-size: 16px; margin: 10px 0;">
-                    <strong>Details:</strong> {message}
-                </p>
-                <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
-                <p style="font-size: 12px; color: #666;">
-                    This alert was generated by Network Monitor at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-                </p>
-            </div>
-        </body>
-        </html>
+    def process_ping_alerts(self, ping_results: Dict):
         """
+        Process ping results and send alerts for failures
+        """
+        for host_name, result in ping_results.items():
+            identifier = f"ping_{host_name}"
+            
+            if self.should_send_alert(identifier, result['success']):
+                if result['success']:
+                    # Recovery alert
+                    message = f"Host {host_name} ({result['address']}) is back online"
+                    self.send_console_alert("HOST RECOVERY", message, "RECOVERY")
+                    
+                    if self.config.get('alerts.email.enabled', False):
+                        self.send_email_alert(
+                            f"Host {host_name} Recovery",
+                            message,
+                            "RECOVERY"
+                        )
+                else:
+                    # Failure alert
+                    failure_count = self.consecutive_failures.get(identifier, 0)
+                    message = f"Host {host_name} ({result['address']}) is unreachable (Failed {failure_count} consecutive times)"
+                    
+                    severity = "CRITICAL" if failure_count >= 5 else "WARNING"
+                    self.send_console_alert("HOST DOWN", message, severity)
+                    
+                    if self.config.get('alerts.email.enabled', False):
+                        self.send_email_alert(
+                            f"Host {host_name} Down",
+                            message,
+                            severity
+                        )
     
-    def send_test_alert(self) -> None:
-        """Send test alert to verify alert system is working"""
-        test_message = f"Network Monitor test alert - System is working properly"
-        
-        if self.config.get('console', True):
-            print(f"{Fore.CYAN}🔵 TEST ALERT: {test_message}{Style.RESET_ALL}")
-        
-        if self.config.get('email', False):
-            self._send_email_alert('test_alert', test_message, 'Network Monitor')
-        
-        if self.logger:
-            self.logger.info(f"TEST ALERT: {test_message}")
+    def process_port_alerts(self, port_results: Dict):
+        """
+        Process port check results and send alerts for failures
+        """
+        for host_name, host_data in port_results.items():
+            for port_num, port_result in host_data.get('ports', {}).items():
+                identifier = f"port_{host_name}_{port_num}"
+                
+                if self.should_send_alert(identifier, port_result['success']):
+                    if port_result['success']:
+                        # Recovery alert
+                        message = f"Port {port_num} ({port_result['name']}) on {host_name} is back online"
+                        self.send_console_alert("PORT RECOVERY", message, "RECOVERY")
+                        
+                        if self.config.get('alerts.email.enabled', False):
+                            self.send_email_alert(
+                                f"Port {port_num} on {host_name} Recovery",
+                                message,
+                                "RECOVERY"
+                            )
+                    else:
+                        # Failure alert
+                        failure_count = self.consecutive_failures.get(identifier, 0)
+                        message = f"Port {port_num} ({port_result['name']}) on {host_name} ({host_data['address']}) is unreachable (Failed {failure_count} consecutive times)"
+                        
+                        severity = "CRITICAL" if failure_count >= 5 else "WARNING"
+                        self.send_console_alert("PORT DOWN", message, severity)
+                        
+                        if self.config.get('alerts.email.enabled', False):
+                            self.send_email_alert(
+                                f"Port {port_num} on {host_name} Down",
+                                message,
+                                severity
+                            )
     
-    def send_summary_alert(self, summary_data: Dict[str, Any]) -> None:
-        """Send periodic summary alert"""
-        total_hosts = summary_data.get('total_hosts', 0)
-        up_hosts = summary_data.get('up_hosts', 0)
-        total_services = summary_data.get('total_services', 0)
-        up_services = summary_data.get('up_services', 0)
+    def send_summary_alert(self, ping_stats: Dict, port_stats: Dict):
+        """
+        Send periodic summary alert
+        """
+        message_parts = []
         
-        message = (f"Network Monitor Summary - "
-                  f"Hosts: {up_hosts}/{total_hosts} UP, "
-                  f"Services: {up_services}/{total_services} UP")
+        # Ping summary
+        if ping_stats:
+            message_parts.append(f"Ping Statistics:")
+            message_parts.append(f"  - Success Rate: {ping_stats.get('success_rate', 0):.1f}%")
+            message_parts.append(f"  - Average Response Time: {ping_stats.get('average_response_time', 0):.2f}ms")
+            message_parts.append(f"  - Failed Hosts: {ping_stats.get('failed_pings', 0)}")
         
-        if self.config.get('console', True):
-            if up_hosts == total_hosts and up_services == total_services:
-                print(f"{Fore.GREEN}📊 {message}{Style.RESET_ALL}")
-            else:
-                print(f"{Fore.YELLOW}📊 {message}{Style.RESET_ALL}")
+        # Port summary
+        if port_stats:
+            message_parts.append(f"\nPort Statistics:")
+            message_parts.append(f"  - Success Rate: {port_stats.get('success_rate', 0):.1f}%")
+            message_parts.append(f"  - Average Response Time: {port_stats.get('average_response_time', 0):.2f}ms")
+            message_parts.append(f"  - Failed Checks: {port_stats.get('failed_checks', 0)}")
         
-        if self.logger:
-            self.logger.info(f"SUMMARY: {message}")
+        if message_parts:
+            message = "\n".join(message_parts)
+            self.send_console_alert("SUMMARY", message, "INFO")
     
-    def clear_alert_history(self) -> None:
-        """Clear alert history (useful for testing)"""
+    def get_alert_history(self, hours: int = 24) -> List[Dict]:
+        """
+        Get alert history for the specified number of hours
+        """
+        cutoff_time = time.time() - (hours * 3600)
+        recent_alerts = []
+        
+        for identifier, alerts in self.alert_history.items():
+            for alert in alerts:
+                if alert['timestamp'] >= cutoff_time:
+                    recent_alerts.append(alert)
+        
+        return sorted(recent_alerts, key=lambda x: x['timestamp'], reverse=True)
+    
+    def clear_alert_history(self):
+        """
+        Clear all alert history
+        """
         self.alert_history.clear()
-        if self.logger:
-            self.logger.info("Alert history cleared")
+        self.consecutive_failures.clear()
+        self.last_alert_time.clear()
+        self.logger.log_system_info("Alert history cleared")
+    
+    def get_current_alerts(self) -> Dict:
+        """
+        Get current active alerts (services that are down)
+        """
+        current_alerts = {
+            'ping_failures': [],
+            'port_failures': []
+        }
+        
+        for identifier, count in self.consecutive_failures.items():
+            if count > 0:
+                if identifier.startswith('ping_'):
+                    host_name = identifier.replace('ping_', '')
+                    current_alerts['ping_failures'].append({
+                        'host': host_name,
+                        'failure_count': count
+                    })
+                elif identifier.startswith('port_'):
+                    parts = identifier.replace('port_', '').split('_')
+                    if len(parts) >= 2:
+                        host_name = '_'.join(parts[:-1])
+                        port = parts[-1]
+                        current_alerts['port_failures'].append({
+                            'host': host_name,
+                            'port': port,
+                            'failure_count': count
+                        })
+        
+        return current_alerts
+    
+    def test_email_configuration(self) -> bool:
+        """
+        Test email configuration by sending a test email
+        """
+        return self.send_email_alert(
+            "Email Configuration Test",
+            "This is a test email to verify your email alert configuration is working correctly.",
+            "INFO"
+        )
+    
+    def suppress_alerts(self, identifier: str, duration_minutes: int = 60):
+        """
+        Suppress alerts for a specific service for a given duration
+        """
+        suppress_until = time.time() + (duration_minutes * 60)
+        self.last_alert_time[f"suppress_{identifier}"] = suppress_until
+        
+        self.logger.log_system_info(f"Alerts suppressed for {identifier} for {duration_minutes} minutes")
+    
+    def is_alert_suppressed(self, identifier: str) -> bool:
+        """
+        Check if alerts are currently suppressed for an identifier
+        """
+        suppress_key = f"suppress_{identifier}"
+        if suppress_key in self.last_alert_time:
+            return time.time() < self.last_alert_time[suppress_key]
+        return False
