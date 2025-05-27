@@ -1,142 +1,206 @@
-"""
-Ping Checker Module
-Handles ICMP ping functionality to test host reachability
-"""
+import asyncio
 import subprocess
 import platform
-import re
+import socket
 import time
-from typing import Tuple, Optional
-
+from typing import Dict, List, Optional, Tuple
+from ping3 import ping
+from config_manager import ConfigManager
+from logger import NetworkLogger
 
 class PingChecker:
-    def __init__(self, timeout: int = 5):
-        self.timeout = timeout
+    def __init__(self, config_manager: ConfigManager, logger: NetworkLogger):
+        self.config = config_manager
+        self.logger = logger
         self.system = platform.system().lower()
+        self.ping_results = {}
         
-    def ping_host(self, host: str, count: int = 1) -> Tuple[bool, Optional[float]]:
+    async def ping_host(self, host: str, timeout: int = 5) -> Tuple[bool, Optional[float]]:
         """
-        Ping a host and return success status and response time
-        
-        Args:
-            host: IP address or hostname to ping
-            count: Number of ping packets to send
-            
-        Returns:
-            Tuple of (success: bool, response_time: float in ms)
+        Ping a single host and return success status and response time
         """
         try:
-            # Build ping command based on operating system
-            if self.system == "windows":
-                cmd = ["ping", "-n", str(count), "-w", str(self.timeout * 1000), host]
-            else:  # Linux/Unix/macOS
-                cmd = ["ping", "-c", str(count), "-W", str(self.timeout), host]
+            # Try ping3 first (more reliable)
+            response_time = ping(host, timeout=timeout, unit='ms')
             
-            # Execute ping command
-            start_time = time.time()
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout + 5  # Add buffer to subprocess timeout
-            )
-            end_time = time.time()
-            
-            # Check if ping was successful
-            if result.returncode == 0:
-                response_time = self._extract_response_time(result.stdout)
-                if response_time is None:
-                    # If we can't parse response time, calculate it manually
-                    response_time = (end_time - start_time) * 1000
+            if response_time is not None:
+                self.logger.log_ping_result(host, True, response_time)
                 return True, response_time
             else:
-                return False, None
+                # Fallback to subprocess ping
+                return await self._subprocess_ping(host, timeout)
                 
-        except subprocess.TimeoutExpired:
-            return False, None
         except Exception as e:
-            print(f"Error pinging {host}: {e}")
+            self.logger.get_logger('ping').error(f"Error pinging {host}: {str(e)}")
             return False, None
     
-    def _extract_response_time(self, ping_output: str) -> Optional[float]:
+    async def _subprocess_ping(self, host: str, timeout: int) -> Tuple[bool, Optional[float]]:
         """
-        Extract response time from ping output
-        
-        Args:
-            ping_output: Raw output from ping command
-            
-        Returns:
-            Response time in milliseconds or None if not found
+        Fallback ping using subprocess
         """
         try:
-            if self.system == "windows":
-                # Windows ping output format: "time=XXXms" or "time<1ms"
-                time_match = re.search(r'time[<=](\d+(?:\.\d+)?)ms', ping_output)
-                if time_match:
-                    return float(time_match.group(1))
+            if self.system == 'windows':
+                cmd = ['ping', '-n', '1', '-w', str(timeout * 1000), host]
+            else:
+                cmd = ['ping', '-c', '1', '-W', str(timeout), host]
+            
+            start_time = time.time()
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), 
+                timeout=timeout + 1
+            )
+            
+            response_time = (time.time() - start_time) * 1000  # Convert to ms
+            
+            if process.returncode == 0:
+                self.logger.log_ping_result(host, True, response_time)
+                return True, response_time
+            else:
+                self.logger.log_ping_result(host, False)
+                return False, None
                 
-                # Handle "time<1ms" case
-                if "time<1ms" in ping_output:
-                    return 0.5
-                    
-            else:  # Linux/Unix/macOS
-                # Unix ping output format: "time=XXX ms" or "time=XXX.XXX ms"
-                time_match = re.search(r'time=(\d+(?:\.\d+)?)\s*ms', ping_output)
-                if time_match:
-                    return float(time_match.group(1))
-            
-            return None
-            
-        except Exception:
+        except asyncio.TimeoutError:
+            self.logger.log_ping_result(host, False)
+            return False, None
+        except Exception as e:
+            self.logger.get_logger('ping').error(f"Subprocess ping error for {host}: {str(e)}")
+            return False, None
+    
+    async def ping_multiple_hosts(self, hosts: List[Dict]) -> Dict[str, Dict]:
+        """
+        Ping multiple hosts concurrently
+        """
+        timeout = self.config.get('monitoring.timeout', 5)
+        tasks = []
+        host_info = {}
+        
+        for host in hosts:
+            if host.get('enabled', True):
+                host_name = host.get('name', host.get('address'))
+                host_address = host.get('address')
+                
+                task = asyncio.create_task(
+                    self.ping_host(host_address, timeout),
+                    name=host_name
+                )
+                tasks.append(task)
+                host_info[host_name] = {
+                    'address': host_address,
+                    'task': task
+                }
+        
+        # Wait for all pings to complete
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        ping_results = {}
+        for i, (host_name, info) in enumerate(host_info.items()):
+            if i < len(results):
+                result = results[i]
+                if isinstance(result, Exception):
+                    ping_results[host_name] = {
+                        'address': info['address'],
+                        'success': False,
+                        'response_time': None,
+                        'error': str(result),
+                        'timestamp': time.time()
+                    }
+                else:
+                    success, response_time = result
+                    ping_results[host_name] = {
+                        'address': info['address'],
+                        'success': success,
+                        'response_time': response_time,
+                        'error': None,
+                        'timestamp': time.time()
+                    }
+        
+        self.ping_results = ping_results
+        return ping_results
+    
+    def get_ping_statistics(self) -> Dict:
+        """
+        Get ping statistics
+        """
+        if not self.ping_results:
+            return {}
+        
+        total_hosts = len(self.ping_results)
+        successful_pings = sum(1 for result in self.ping_results.values() if result['success'])
+        failed_pings = total_hosts - successful_pings
+        
+        response_times = [
+            result['response_time'] for result in self.ping_results.values() 
+            if result['success'] and result['response_time'] is not None
+        ]
+        
+        stats = {
+            'total_hosts': total_hosts,
+            'successful_pings': successful_pings,
+            'failed_pings': failed_pings,
+            'success_rate': (successful_pings / total_hosts * 100) if total_hosts > 0 else 0,
+            'average_response_time': sum(response_times) / len(response_times) if response_times else 0,
+            'min_response_time': min(response_times) if response_times else 0,
+            'max_response_time': max(response_times) if response_times else 0
+        }
+        
+        return stats
+    
+    def get_failed_hosts(self) -> List[str]:
+        """
+        Get list of hosts that failed ping
+        """
+        return [
+            host_name for host_name, result in self.ping_results.items()
+            if not result['success']
+        ]
+    
+    async def continuous_ping_check(self, interval: int = 30):
+        """
+        Continuously ping hosts at specified interval
+        """
+        self.logger.log_system_info(f"Starting continuous ping monitoring (interval: {interval}s)")
+        
+        while True:
+            try:
+                hosts = self.config.get_enabled_hosts()
+                await self.ping_multiple_hosts(hosts)
+                
+                # Log summary
+                stats = self.get_ping_statistics()
+                self.logger.get_logger('ping').info(
+                    f"Ping check completed - Success rate: {stats.get('success_rate', 0):.1f}% "
+                    f"({stats.get('successful_pings', 0)}/{stats.get('total_hosts', 0)})"
+                )
+                
+                await asyncio.sleep(interval)
+                
+            except Exception as e:
+                self.logger.log_error('ping', e)
+                await asyncio.sleep(interval)
+    
+    def resolve_hostname(self, hostname: str) -> Optional[str]:
+        """
+        Resolve hostname to IP address
+        """
+        try:
+            ip_address = socket.gethostbyname(hostname)
+            return ip_address
+        except socket.gaierror:
             return None
     
-    def ping_multiple_hosts(self, hosts: list) -> dict:
+    def is_valid_ip(self, ip: str) -> bool:
         """
-        Ping multiple hosts and return results
-        
-        Args:
-            hosts: List of host dictionaries with 'name' and 'ip' keys
-            
-        Returns:
-            Dictionary with host results
+        Check if string is a valid IP address
         """
-        results = {}
-        
-        for host_info in hosts:
-            host_name = host_info.get('name', host_info.get('ip'))
-            host_ip = host_info.get('ip')
-            
-            if not host_ip:
-                results[host_name] = {'success': False, 'response_time': None, 'error': 'No IP specified'}
-                continue
-            
-            success, response_time = self.ping_host(host_ip)
-            results[host_name] = {
-                'success': success,
-                'response_time': response_time,
-                'ip': host_ip,
-                'timestamp': time.time()
-            }
-        
-        return results
-    
-    def is_host_reachable(self, host: str, retries: int = 3) -> bool:
-        """
-        Check if host is reachable with retry logic
-        
-        Args:
-            host: IP address or hostname
-            retries: Number of retry attempts
-            
-        Returns:
-            True if host is reachable, False otherwise
-        """
-        for attempt in range(retries):
-            success, _ = self.ping_host(host)
-            if success:
-                return True
-            
-            if attempt < retries - 1:  # Don't sleep on last attempt
-                time.sleep(1)
-        
-        return False
+        try:
+            socket.inet_aton(ip)
+            return True
+        except socket.error:
+            return False    
